@@ -38,7 +38,6 @@ const FIREBASE_CONFIG = {
 
 const FACILITATOR_PASSWORD = 'aiedu';
 
-// ── Scenarios ─────────────────────────────────────────────────
 const SCENARIOS = [
   { id: 1, title: 'AI Scenario #1', text: 'Preparing to have a tough conversation by practicing it first with an AI bot.' },
   { id: 2, title: 'AI Scenario #2', text: "Using a friend's photo to create a deep fake video as a joke." },
@@ -46,7 +45,6 @@ const SCENARIOS = [
   { id: 4, title: 'AI Scenario #4', text: 'Creating a holographic version of yourself to attend a far-away family gathering.' }
 ];
 
-// ── "What If?" prompts (facilitator picks one per scenario) ──
 const WHAT_IFS = [
   "What if someone uses this tool every day and stops talking to real people?",
   "What if the AI is just helping spark ideas, not replacing anyone?",
@@ -58,99 +56,203 @@ const WHAT_IFS = [
   "What if other people find out this person is using AI for this?"
 ];
 
-// ── Phases ────────────────────────────────────────────────────
-// Flow: Welcome → [Vote → What If? → Revote] x4 → Summary → Reflect → Close
 const PHASES = [
   { id: 'welcome', type: 'welcome', label: 'Welcome' },
-
   { id: 's1-vote',   type: 'vote',   scenarioIndex: 0, label: 'Scenario 1 — Vote' },
   { id: 's1-whatif', type: 'whatif', scenarioIndex: 0, label: 'Scenario 1 — What If?' },
   { id: 's1-revote', type: 'revote', scenarioIndex: 0, label: 'Scenario 1 — Revote' },
-
   { id: 's2-vote',   type: 'vote',   scenarioIndex: 1, label: 'Scenario 2 — Vote' },
   { id: 's2-whatif', type: 'whatif', scenarioIndex: 1, label: 'Scenario 2 — What If?' },
   { id: 's2-revote', type: 'revote', scenarioIndex: 1, label: 'Scenario 2 — Revote' },
-
   { id: 's3-vote',   type: 'vote',   scenarioIndex: 2, label: 'Scenario 3 — Vote' },
   { id: 's3-whatif', type: 'whatif', scenarioIndex: 2, label: 'Scenario 3 — What If?' },
   { id: 's3-revote', type: 'revote', scenarioIndex: 2, label: 'Scenario 3 — Revote' },
-
   { id: 's4-vote',   type: 'vote',   scenarioIndex: 3, label: 'Scenario 4 — Vote' },
   { id: 's4-whatif', type: 'whatif', scenarioIndex: 3, label: 'Scenario 4 — What If?' },
   { id: 's4-revote', type: 'revote', scenarioIndex: 3, label: 'Scenario 4 — Revote' },
-
   { id: 'summary', type: 'summary', label: 'Summary' },
   { id: 'reflect', type: 'reflect', label: 'Reflect & Discuss' },
   { id: 'close',   type: 'close',   label: 'Closing' }
 ];
 
-// ── Firebase init ─────────────────────────────────────────────
+// ── Firebase ──────────────────────────────────────────────────
 firebase.initializeApp(FIREBASE_CONFIG);
 const auth = firebase.auth();
 const db   = firebase.firestore();
 
-// ── App state ─────────────────────────────────────────────────
+// ── URL / room ────────────────────────────────────────────────
+const params   = new URLSearchParams(location.search);
+const VIEW     = params.get('view') || 'participant';
+let   roomCode = params.get('room') || null;
+
+function setRoomCode(code) {
+  roomCode = code;
+  const url = new URL(location.href);
+  url.searchParams.set('room', code);
+  history.replaceState(null, '', url.toString());
+}
+
+function generateRoomCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  return Array.from({ length: 4 }, () => chars[Math.floor(Math.random() * chars.length)]).join('');
+}
+
+// ── Participant ID — unique per browser tab via sessionStorage ─
+function getParticipantId() {
+  let id = sessionStorage.getItem('ai-effect-pid');
+  if (!id) {
+    id = Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 10);
+    sessionStorage.setItem('ai-effect-pid', id);
+  }
+  return id;
+}
+
+// ── Firestore ref ─────────────────────────────────────────────
+const sessionRef = () => db.collection('sessions').doc(roomCode);
+
+// ── App state (all driven from a single session doc snapshot) ─
 let userId            = null;
 let phaseIndex        = 0;
-let sessionData       = {};
+let sessionData       = {};   // full session doc: { phaseIndex, whatifs, responses }
 let submittedPhases   = new Set();
 let facilitatorAuthed = sessionStorage.getItem('fac-authed') === 'true';
-let responseUnsub     = null;
-let currentResponses  = [];
-let allResponses      = []; // for summary view
 
-const VIEW = new URLSearchParams(location.search).get('view') || 'participant';
+// ── Response helpers — read from sessionData, no extra queries ─
+function responsesFor(phaseId) {
+  return Object.values(sessionData.responses || {}).filter(r => r.phaseId === phaseId);
+}
+function responsesOfTypes(...types) {
+  return Object.values(sessionData.responses || {}).filter(r => types.includes(r.type));
+}
+function getWhatif(phaseId) {
+  return sessionData.whatifs?.[phaseId] || null;
+}
 
-// ── Boot ──────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+//  BOOT
+// ═══════════════════════════════════════════════════════════════
 async function boot() {
   try {
     const cred = await auth.signInAnonymously();
     userId = cred.user.uid;
   } catch (e) {
-    setHTML(`
-      <div class="max-w-md mx-auto mt-20 p-8 bg-white rounded-2xl shadow text-center">
-        <h2 class="text-red-500 font-bold text-lg mb-2">Firebase Auth Failed</h2>
-        <p class="text-slate-500 text-sm mb-3">Enable <strong>Anonymous</strong> sign-in in Firebase Console → Authentication → Sign-in method.</p>
-        <p class="text-slate-400 text-xs font-mono bg-slate-50 rounded-lg px-3 py-2">${esc(e.code)}</p>
-      </div>`);
+    setHTML(`<div class="max-w-md mx-auto mt-20 p-8 bg-white rounded-2xl shadow text-center">
+      <h2 class="text-red-500 font-bold text-lg mb-2">Firebase Auth Failed</h2>
+      <p class="text-slate-500 text-sm mb-3">Enable Anonymous sign-in in Firebase Console → Authentication → Sign-in method.</p>
+      <p class="text-slate-400 text-xs font-mono bg-slate-50 rounded p-2">${esc(e.code)}</p>
+    </div>`);
     return;
   }
 
-  db.collection('sessions').doc('current').onSnapshot(doc => {
+  if (VIEW === 'facilitator') {
+    if (!facilitatorAuthed) { renderFacilitatorLogin(); return; }
+    if (!roomCode)           { renderRoomCreate(); return; }
+  }
+
+  if ((VIEW === 'participant' || VIEW === 'display') && !roomCode) {
+    renderJoinRoom(); return;
+  }
+
+  startListening();
+}
+
+function startListening() {
+  sessionRef().onSnapshot(doc => {
     sessionData = doc.exists ? doc.data() : {};
-    phaseIndex = Math.min(Math.max(parseInt(sessionData.phaseIndex) || 0, 0), PHASES.length - 1);
-    render();
+    phaseIndex  = Math.min(Math.max(parseInt(sessionData.phaseIndex) || 0, 0), PHASES.length - 1);
+    if (VIEW === 'display')          renderDisplay();
+    else if (VIEW === 'facilitator') renderFacilitator();
+    else                             renderParticipant();
+  }, err => {
+    setHTML(`<div class="max-w-lg mx-auto mt-20 p-8 bg-white rounded-2xl shadow">
+      <h2 class="text-red-500 font-bold text-lg mb-2">Firestore permission error</h2>
+      <p class="text-slate-600 text-sm mb-4">Set these rules in Firebase Console → Firestore Database → Rules:</p>
+      <pre class="bg-slate-900 text-green-300 text-xs rounded-xl p-4 overflow-x-auto">rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /{document=**} {
+      allow read, write: if request.auth != null;
+    }
+  }
+}</pre>
+      <p class="text-red-400 text-xs mt-3 font-mono">${esc(err.message)}</p>
+    </div>`);
   });
 }
 
-// ── Render dispatcher ─────────────────────────────────────────
-function render() {
-  if      (VIEW === 'display')     renderDisplay();
-  else if (VIEW === 'facilitator') renderFacilitator();
-  else                             renderParticipant();
+// ═══════════════════════════════════════════════════════════════
+//  ROOM SCREENS
+// ═══════════════════════════════════════════════════════════════
+function renderRoomCreate() {
+  setHTML(`
+    <div class="min-h-screen bg-slate-900 flex items-center justify-center">
+      <div class="bg-slate-800 border border-slate-700 rounded-2xl p-10 w-96 shadow-2xl">
+        <h1 class="text-lg font-bold text-slate-100 mb-1">Create a New Session</h1>
+        <p class="text-slate-500 text-xs mb-6">Each session gets a unique 4-character room code. Share it with participants.</p>
+        <button id="create-btn" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-semibold py-3 rounded-xl transition text-sm">Create Session</button>
+        <div class="mt-5 border-t border-slate-700 pt-5">
+          <p class="text-slate-500 text-xs mb-2">Or resume an existing session:</p>
+          <div class="flex gap-2">
+            <input id="join-code" type="text" maxlength="4" placeholder="Room code"
+              class="flex-1 bg-slate-900 border border-slate-600 rounded-xl px-4 py-2 text-slate-100 text-sm uppercase tracking-widest focus:outline-none focus:border-indigo-500" />
+            <button id="join-btn" class="px-4 py-2 bg-slate-700 hover:bg-slate-600 text-slate-200 text-sm font-semibold rounded-xl transition">Join</button>
+          </div>
+        </div>
+      </div>
+    </div>`);
+
+  document.getElementById('create-btn').addEventListener('click', async () => {
+    const code = generateRoomCode();
+    setRoomCode(code);
+    await sessionRef().set({ phaseIndex: 0, whatifs: {}, responses: {} });
+    startListening();
+  });
+  document.getElementById('join-btn').addEventListener('click', () => {
+    const code = document.getElementById('join-code').value.trim().toUpperCase();
+    if (code.length === 4) { setRoomCode(code); startListening(); }
+  });
+  document.getElementById('join-code').addEventListener('keydown', e => { if (e.key === 'Enter') document.getElementById('join-btn').click(); });
 }
 
-// Helper to get the "What If?" question selected for a phase
-function getWhatif(phaseId) {
-  return sessionData.whatifs?.[phaseId] || null;
+function renderJoinRoom() {
+  const dark = VIEW === 'display';
+  setHTML(`
+    <div class="min-h-screen ${dark ? 'bg-slate-900' : 'bg-slate-50'} flex items-center justify-center">
+      <div class="${dark ? 'bg-slate-800 border-slate-700' : 'bg-white border-slate-100'} border rounded-2xl p-10 w-80 shadow-xl">
+        <h1 class="text-lg font-bold ${dark ? 'text-slate-100' : 'text-slate-800'} mb-1">The AI Effect</h1>
+        <p class="${dark ? 'text-slate-400' : 'text-slate-500'} text-xs mb-5">Enter the room code from your facilitator.</p>
+        <input id="room-input" type="text" maxlength="4" placeholder="CODE"
+          class="${dark ? 'bg-slate-900 border-slate-600 text-slate-100' : 'bg-white border-slate-300 text-slate-800'} w-full border rounded-xl px-4 py-3 text-center text-2xl font-black uppercase tracking-[0.3em] focus:outline-none focus:border-indigo-500 mb-3" />
+        <button id="room-submit" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-semibold py-3 rounded-xl transition text-sm">Join</button>
+        <p id="room-error" class="text-red-400 text-xs mt-2 hidden text-center">Enter a valid 4-character code.</p>
+      </div>
+    </div>`);
+
+  const doJoin = () => {
+    const code = document.getElementById('room-input').value.trim().toUpperCase();
+    if (code.length === 4) { setRoomCode(code); startListening(); }
+    else document.getElementById('room-error').classList.remove('hidden');
+  };
+  document.getElementById('room-submit').addEventListener('click', doJoin);
+  document.getElementById('room-input').addEventListener('keydown', e => { if (e.key === 'Enter') doJoin(); });
+  document.getElementById('room-input').focus();
 }
 
 // ═══════════════════════════════════════════════════════════════
 //  PARTICIPANT VIEW
 // ═══════════════════════════════════════════════════════════════
 function renderParticipant() {
-  const phase = PHASES[phaseIndex];
+  const phase     = PHASES[phaseIndex];
   const submitted = submittedPhases.has(phase.id);
-  const noInput = ['welcome', 'whatif', 'summary', 'reflect', 'close'].includes(phase.type);
+  const noInput   = ['welcome', 'whatif', 'summary', 'reflect', 'close'].includes(phase.type);
 
   let body = '';
   if (submitted && !noInput) {
-    body = `
-      <div class="text-center py-12">
-        <div class="w-14 h-14 rounded-full bg-green-100 flex items-center justify-center mx-auto mb-3 text-2xl">✓</div>
-        <h3 class="font-bold text-lg text-slate-800">Response submitted</h3>
-        <p class="text-slate-400 text-sm mt-1">Waiting for your facilitator to continue...</p>
-      </div>`;
+    body = `<div class="text-center py-12">
+      <div class="w-14 h-14 rounded-full bg-green-100 flex items-center justify-center mx-auto mb-3 text-2xl">✓</div>
+      <h3 class="font-bold text-lg text-slate-800">Response submitted</h3>
+      <p class="text-slate-400 text-sm mt-1">Waiting for your facilitator to continue...</p>
+    </div>`;
   } else {
     switch (phase.type) {
       case 'welcome': body = pWelcome(); break;
@@ -167,6 +269,7 @@ function renderParticipant() {
     <div class="min-h-screen bg-slate-50">
       <header class="bg-indigo-900 text-white px-5 py-3 flex justify-between items-center sticky top-0 z-10">
         <span class="font-bold text-sm tracking-wide">The AI Effect</span>
+        <span class="text-indigo-300 text-xs font-mono">${esc(roomCode)}</span>
       </header>
       <main class="max-w-lg mx-auto px-4 py-8">
         <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-7">${body}</div>
@@ -177,20 +280,17 @@ function renderParticipant() {
 }
 
 function pWelcome() {
-  return `
-    <div class="text-center py-8">
-      <div class="text-4xl mb-3">👋</div>
-      <h2 class="text-xl font-bold text-slate-800">Welcome!</h2>
-      <p class="text-slate-400 text-sm mt-1">Your facilitator will start the activity shortly.</p>
-    </div>`;
+  return `<div class="text-center py-8">
+    <div class="text-4xl mb-3">👋</div>
+    <h2 class="text-xl font-bold text-slate-800">Welcome!</h2>
+    <p class="text-slate-400 text-sm mt-1">Your facilitator will start the activity shortly.</p>
+  </div>`;
 }
 
 function pVote(scenario, phase) {
   return `
     <div class="text-xs font-bold uppercase tracking-widest text-indigo-500 mb-2">${esc(scenario.title)} — Vote</div>
-    <div class="bg-indigo-50 border-l-4 border-indigo-400 rounded-r-xl px-4 py-3 italic text-slate-600 text-sm mb-5 leading-relaxed">
-      "${esc(scenario.text)}"
-    </div>
+    <div class="bg-indigo-50 border-l-4 border-indigo-400 rounded-r-xl px-4 py-3 italic text-slate-600 text-sm mb-5 leading-relaxed">"${esc(scenario.text)}"</div>
     <h2 class="text-base font-bold text-slate-800 mb-4">Does this support or erode human connection, or does it depend?</h2>
     <div class="flex gap-3" id="vote-buttons">
       <button class="vote-btn flex-1 py-3 border-2 border-slate-200 rounded-xl text-sm font-semibold text-slate-600 transition" data-vote="supports">Supports</button>
@@ -203,33 +303,25 @@ function pWhatifView(scenario, phase) {
   const question = getWhatif(phase.id);
   return `
     <div class="text-xs font-bold uppercase tracking-widest text-amber-500 mb-2">${esc(scenario.title)} — What If?</div>
-    <div class="bg-indigo-50 border-l-4 border-indigo-400 rounded-r-xl px-4 py-3 italic text-slate-600 text-sm mb-5 leading-relaxed">
-      "${esc(scenario.text)}"
-    </div>
+    <div class="bg-indigo-50 border-l-4 border-indigo-400 rounded-r-xl px-4 py-3 italic text-slate-600 text-sm mb-5 leading-relaxed">"${esc(scenario.text)}"</div>
     ${question
       ? `<div class="bg-amber-50 border border-amber-200 rounded-xl p-5 text-center">
            <div class="text-amber-500 text-2xl mb-2">"</div>
            <p class="text-slate-700 text-base font-medium leading-relaxed">${esc(question)}</p>
          </div>
          <p class="text-slate-400 text-xs text-center mt-3">Consider this question. Your facilitator will open revoting shortly.</p>`
-      : `<div class="text-center py-6">
-           <p class="text-slate-400 text-sm">Waiting for your facilitator to choose a question...</p>
-         </div>`}`;
+      : `<div class="text-center py-6"><p class="text-slate-400 text-sm">Waiting for your facilitator to choose a question...</p></div>`}`;
 }
 
 function pRevote(scenario, phase) {
-  const whatifPhaseId = phase.id.replace('-revote', '-whatif');
-  const question = getWhatif(whatifPhaseId);
+  const question = getWhatif(phase.id.replace('-revote', '-whatif'));
   return `
     <div class="text-xs font-bold uppercase tracking-widest text-indigo-500 mb-2">${esc(scenario.title)} — Revote</div>
-    <div class="bg-indigo-50 border-l-4 border-indigo-400 rounded-r-xl px-4 py-3 italic text-slate-600 text-sm mb-4 leading-relaxed">
-      "${esc(scenario.text)}"
-    </div>
-    ${question ? `
-      <div class="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 mb-5">
-        <p class="text-xs font-bold text-amber-600 mb-1">What If?</p>
-        <p class="text-slate-600 text-sm leading-relaxed">${esc(question)}</p>
-      </div>` : ''}
+    <div class="bg-indigo-50 border-l-4 border-indigo-400 rounded-r-xl px-4 py-3 italic text-slate-600 text-sm mb-4 leading-relaxed">"${esc(scenario.text)}"</div>
+    ${question ? `<div class="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 mb-5">
+      <p class="text-xs font-bold text-amber-600 mb-1">What If?</p>
+      <p class="text-slate-600 text-sm leading-relaxed">${esc(question)}</p>
+    </div>` : ''}
     <h2 class="text-base font-bold text-slate-800 mb-4">After considering the "What If?" — would you change your vote?</h2>
     <div class="flex gap-3" id="vote-buttons">
       <button class="vote-btn flex-1 py-3 border-2 border-slate-200 rounded-xl text-sm font-semibold text-slate-600 transition" data-vote="supports">Supports</button>
@@ -239,12 +331,11 @@ function pRevote(scenario, phase) {
 }
 
 function pSummary() {
-  return `
-    <div class="text-center py-6">
-      <div class="text-3xl mb-3">📊</div>
-      <h2 class="text-lg font-bold text-slate-800 mb-2">Summary</h2>
-      <p class="text-slate-400 text-sm">Look at the shared screen to see how votes shifted across all four scenarios.</p>
-    </div>`;
+  return `<div class="text-center py-6">
+    <div class="text-3xl mb-3">📊</div>
+    <h2 class="text-lg font-bold text-slate-800 mb-2">Summary</h2>
+    <p class="text-slate-400 text-sm">Look at the shared screen to see how votes shifted across all four scenarios.</p>
+  </div>`;
 }
 
 function pReflect() {
@@ -262,122 +353,83 @@ function pReflect() {
 }
 
 function pClose() {
-  return `
-    <div class="text-center py-8">
-      <div class="text-3xl mb-3">🤝</div>
-      <h2 class="text-lg font-bold text-slate-800 mb-3">Thank you!</h2>
-      <p class="text-slate-500 text-sm leading-relaxed max-w-sm mx-auto">
-        AI tools can both support and erode human connection. Being aware of their impact
-        can help us make informed choices about their use.
-      </p>
-    </div>`;
+  return `<div class="text-center py-8">
+    <div class="text-3xl mb-3">🤝</div>
+    <h2 class="text-lg font-bold text-slate-800 mb-3">Thank you!</h2>
+    <p class="text-slate-500 text-sm leading-relaxed max-w-sm mx-auto">AI tools can both support and erode human connection. Being aware of their impact can help us make informed choices about their use.</p>
+  </div>`;
 }
 
 function attachParticipantListeners(phase) {
-  if (phase.type === 'vote' || phase.type === 'revote') {
-    document.querySelectorAll('.vote-btn').forEach(btn => {
-      btn.addEventListener('click', async () => {
-        const vote = btn.dataset.vote;
-        const styles = {
-          supports: 'border-green-400 bg-green-50 text-green-700',
-          erodes:   'border-red-400 bg-red-50 text-red-700',
-          depends:  'border-yellow-400 bg-yellow-50 text-yellow-700'
-        };
-        document.querySelectorAll('.vote-btn').forEach(b => {
-          b.className = 'vote-btn flex-1 py-3 border-2 rounded-xl text-sm font-semibold transition ' +
-            (b.dataset.vote === vote ? styles[vote] : 'border-slate-200 text-slate-500');
-        });
-        await writeResponse({ phaseId: phase.id, type: phase.type, vote });
+  if (phase.type !== 'vote' && phase.type !== 'revote') return;
+  document.querySelectorAll('.vote-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const vote = btn.dataset.vote;
+      const styles = { supports: 'border-green-400 bg-green-50 text-green-700', erodes: 'border-red-400 bg-red-50 text-red-700', depends: 'border-yellow-400 bg-yellow-50 text-yellow-700' };
+      document.querySelectorAll('.vote-btn').forEach(b => {
+        b.className = 'vote-btn flex-1 py-3 border-2 rounded-xl text-sm font-semibold transition ' +
+          (b.dataset.vote === vote ? styles[vote] : 'border-slate-200 text-slate-500');
       });
+      await writeResponse({ phaseId: phase.id, type: phase.type, vote });
     });
-  }
+  });
 }
 
 async function writeResponse(data) {
+  const pid         = getParticipantId();
+  const responseKey = `${pid}_${data.phaseId}`;
+  const responseVal = { vote: data.vote, type: data.type, phaseId: data.phaseId, userId: pid };
   try {
-    await db.collection('responses').doc(`${userId}_${data.phaseId}`).set({
-      ...data, userId, timestamp: firebase.firestore.FieldValue.serverTimestamp()
-    });
+    // mergeFields with a dot-path safely adds one nested key without
+    // disturbing other responses, and creates the document if needed.
+    await sessionRef().set(
+      { responses: { [responseKey]: responseVal } },
+      { mergeFields: [`responses.${responseKey}`] }
+    );
     submittedPhases.add(data.phaseId);
     renderParticipant();
   } catch (e) {
     console.error('Write error:', e);
-    alert('Something went wrong. Please try again.');
+    alert('Could not save response: ' + e.message);
   }
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  DISPLAY VIEW  (?view=display)
+//  DISPLAY VIEW
 // ═══════════════════════════════════════════════════════════════
 function renderDisplay() {
   const phase = PHASES[phaseIndex];
-  if (responseUnsub) { responseUnsub(); responseUnsub = null; }
-  currentResponses = [];
-
-  if (phase.type === 'summary') {
-    // Summary needs ALL vote + revote responses
-    responseUnsub = db.collection('responses')
-      .where('type', 'in', ['vote', 'revote'])
-      .onSnapshot(snap => {
-        allResponses = snap.docs.map(d => d.data());
-        paintDisplay(phase);
-      });
-  } else if (['vote', 'revote'].includes(phase.type)) {
-    paintDisplay(phase); // immediate empty render
-    responseUnsub = db.collection('responses')
-      .where('phaseId', '==', phase.id)
-      .onSnapshot(snap => {
-        currentResponses = snap.docs.map(d => d.data());
-        paintDisplay(phase);
-      });
-  } else if (phase.type === 'whatif') {
-    // During "What If?" show original votes alongside the question
-    const votePhaseId = phase.id.replace('-whatif', '-vote');
-    paintDisplay(phase);
-    responseUnsub = db.collection('responses')
-      .where('phaseId', '==', votePhaseId)
-      .onSnapshot(snap => {
-        currentResponses = snap.docs.map(d => d.data());
-        paintDisplay(phase);
-      });
-  } else {
-    paintDisplay(phase);
-  }
-}
-
-function paintDisplay(phase) {
   let content = '';
 
   if (phase.type === 'welcome') {
-    content = `
-      <div class="flex flex-col items-center justify-center h-full text-center">
-        <h1 class="text-5xl font-black text-slate-100 mb-3">The AI Effect</h1>
-        <p class="text-slate-500 text-lg">Your facilitator will begin the activity shortly.</p>
-      </div>`;
+    content = `<div class="flex flex-col items-center justify-center h-full text-center">
+      <h1 class="text-5xl font-black text-slate-100 mb-3">The AI Effect</h1>
+      <p class="text-slate-500 text-lg">Your facilitator will begin the activity shortly.</p>
+      <p class="text-slate-700 text-xs font-mono mt-4">Room ${esc(roomCode)}</p>
+    </div>`;
 
   } else if (phase.type === 'vote' || phase.type === 'revote') {
     const scenario = SCENARIOS[phase.scenarioIndex];
-    const r = currentResponses;
+    const r        = responsesFor(phase.id);
     const supports = r.filter(x => x.vote === 'supports').length;
     const erodes   = r.filter(x => x.vote === 'erodes').length;
     const depends  = r.filter(x => x.vote === 'depends').length;
-    const total    = supports + erodes + depends;
-    const pct = n => total > 0 ? Math.round((n / total) * 100) : 0;
+    const total    = r.length;
+    const pct      = n => total > 0 ? Math.round((n / total) * 100) : 0;
     const isRevote = phase.type === 'revote';
-    const whatifQ = isRevote ? getWhatif(phase.id.replace('-revote', '-whatif')) : null;
+    const whatifQ  = isRevote ? getWhatif(phase.id.replace('-revote', '-whatif')) : null;
 
     content = `
       <span class="inline-block text-xs font-black uppercase tracking-widest ${isRevote ? 'bg-purple-900 text-purple-300' : 'bg-indigo-900 text-indigo-300'} px-3 py-1 rounded-full mb-4">
         ${esc(scenario.title)} — ${isRevote ? 'Revote' : 'Vote'}
       </span>
       <div class="border-l-4 border-indigo-500 pl-4 italic text-slate-400 text-base mb-4 leading-relaxed">"${esc(scenario.text)}"</div>
-      ${isRevote && whatifQ ? `
-        <div class="bg-amber-950 border border-amber-800 rounded-xl px-4 py-3 mb-5">
-          <p class="text-xs font-bold text-amber-400 mb-1">What If?</p>
-          <p class="text-slate-300 text-sm leading-relaxed">${esc(whatifQ)}</p>
-        </div>` : ''}
+      ${isRevote && whatifQ ? `<div class="bg-amber-950 border border-amber-800 rounded-xl px-4 py-3 mb-5">
+        <p class="text-xs font-bold text-amber-400 mb-1">What If?</p>
+        <p class="text-slate-300 text-sm leading-relaxed">${esc(whatifQ)}</p>
+      </div>` : ''}
       <p class="text-slate-500 text-sm mb-5">${total} vote${total !== 1 ? 's' : ''}</p>
-      <div class="space-y-4 mb-6">
+      <div class="space-y-4">
         ${voteBarHTML('Supports', supports, pct(supports), 'from-green-700 to-green-500', 'text-green-400')}
         ${voteBarHTML('Erodes',   erodes,   pct(erodes),   'from-red-700 to-red-500',     'text-red-400')}
         ${voteBarHTML('Depends',  depends,  pct(depends),  'from-yellow-700 to-yellow-500','text-yellow-400')}
@@ -386,23 +438,21 @@ function paintDisplay(phase) {
   } else if (phase.type === 'whatif') {
     const scenario = SCENARIOS[phase.scenarioIndex];
     const question = getWhatif(phase.id);
-    // Show original votes for context
-    const r = currentResponses;
+    const r        = responsesFor(phase.id.replace('-whatif', '-vote'));
     const supports = r.filter(x => x.vote === 'supports').length;
     const erodes   = r.filter(x => x.vote === 'erodes').length;
     const depends  = r.filter(x => x.vote === 'depends').length;
-    const total    = supports + erodes + depends;
-    const pct = n => total > 0 ? Math.round((n / total) * 100) : 0;
+    const total    = r.length;
+    const pct      = n => total > 0 ? Math.round((n / total) * 100) : 0;
 
     content = `
       <span class="inline-block text-xs font-black uppercase tracking-widest bg-amber-900 text-amber-300 px-3 py-1 rounded-full mb-4">${esc(scenario.title)} — What If?</span>
       <div class="border-l-4 border-indigo-500 pl-4 italic text-slate-400 text-base mb-5 leading-relaxed">"${esc(scenario.text)}"</div>
-      ${total > 0 ? `
-        <div class="space-y-3 mb-6 opacity-60">
-          ${voteBarHTML('Supports', supports, pct(supports), 'from-green-700 to-green-500', 'text-green-400')}
-          ${voteBarHTML('Erodes',   erodes,   pct(erodes),   'from-red-700 to-red-500',     'text-red-400')}
-          ${voteBarHTML('Depends',  depends,  pct(depends),  'from-yellow-700 to-yellow-500','text-yellow-400')}
-        </div>` : ''}
+      ${total > 0 ? `<div class="space-y-3 mb-6 opacity-60">
+        ${voteBarHTML('Supports', supports, pct(supports), 'from-green-700 to-green-500', 'text-green-400')}
+        ${voteBarHTML('Erodes',   erodes,   pct(erodes),   'from-red-700 to-red-500',     'text-red-400')}
+        ${voteBarHTML('Depends',  depends,  pct(depends),  'from-yellow-700 to-yellow-500','text-yellow-400')}
+      </div>` : ''}
       ${question
         ? `<div class="bg-amber-950 border border-amber-700 rounded-2xl p-8 text-center mt-4">
              <div class="text-amber-400 text-4xl mb-3">"</div>
@@ -428,184 +478,125 @@ function paintDisplay(phase) {
       </div>`;
 
   } else if (phase.type === 'close') {
-    content = `
-      <div class="flex flex-col items-center justify-center h-full text-center px-8">
-        <h1 class="text-3xl font-black text-slate-100 mb-4 leading-tight max-w-2xl">AI tools can both support and erode human connection.</h1>
-        <p class="text-slate-400 text-lg leading-relaxed max-w-xl">Being aware of their impact can help us make informed choices about their use.</p>
-      </div>`;
+    content = `<div class="flex flex-col items-center justify-center h-full text-center px-8">
+      <h1 class="text-3xl font-black text-slate-100 mb-4 leading-tight max-w-2xl">AI tools can both support and erode human connection.</h1>
+      <p class="text-slate-400 text-lg leading-relaxed max-w-xl">Being aware of their impact can help us make informed choices about their use.</p>
+    </div>`;
   }
 
   setHTML(`
     <div class="min-h-screen bg-slate-900 flex flex-col">
       <header class="px-6 py-3 border-b border-slate-800 flex justify-between items-center flex-shrink-0">
         <span class="text-xs font-black uppercase tracking-widest text-indigo-400">The AI Effect</span>
-        <span class="text-xs text-slate-600">${esc(PHASES[phaseIndex].label)}</span>
+        <span class="text-xs text-slate-600">${esc(PHASES[phaseIndex].label)} &nbsp;·&nbsp; Room ${esc(roomCode)}</span>
       </header>
       <main class="flex-1 px-8 py-6 max-w-5xl mx-auto w-full">${content}</main>
     </div>`);
 }
 
 function buildSummaryHTML() {
+  const allResponses = sessionData.responses || {};
+
   const scenarioSummaries = SCENARIOS.map((scenario, i) => {
-    const n = i + 1;
+    const n             = i + 1;
     const votePhaseId   = `s${n}-vote`;
     const revotePhaseId = `s${n}-revote`;
-    const whatifPhaseId = `s${n}-whatif`;
-    const question = getWhatif(whatifPhaseId);
+    const question      = getWhatif(`s${n}-whatif`);
 
-    const origVotes   = allResponses.filter(r => r.phaseId === votePhaseId);
-    const revoteVotes = allResponses.filter(r => r.phaseId === revotePhaseId);
+    const origVotes   = Object.values(allResponses).filter(r => r.phaseId === votePhaseId);
+    const revoteVotes = Object.values(allResponses).filter(r => r.phaseId === revotePhaseId);
 
-    // Build final vote map: use revote if available, otherwise original
     const finalMap = {};
     origVotes.forEach(r => { finalMap[r.userId] = r.vote; });
     revoteVotes.forEach(r => { finalMap[r.userId] = r.vote; });
 
-    const orig = { supports: origVotes.filter(r => r.vote === 'supports').length, erodes: origVotes.filter(r => r.vote === 'erodes').length, depends: origVotes.filter(r => r.vote === 'depends').length };
-    const final = { supports: Object.values(finalMap).filter(v => v === 'supports').length, erodes: Object.values(finalMap).filter(v => v === 'erodes').length, depends: Object.values(finalMap).filter(v => v === 'depends').length };
+    const orig  = { s: origVotes.filter(r=>r.vote==='supports').length, e: origVotes.filter(r=>r.vote==='erodes').length, d: origVotes.filter(r=>r.vote==='depends').length };
+    const final = { s: Object.values(finalMap).filter(v=>v==='supports').length, e: Object.values(finalMap).filter(v=>v==='erodes').length, d: Object.values(finalMap).filter(v=>v==='depends').length };
+    const diff  = (a,b) => { const d=b-a; return d>0?`<span class="text-green-400">+${d}</span>`:d<0?`<span class="text-red-400">${d}</span>`:`<span class="text-slate-600">0</span>`; };
 
-    const diff = (a, b) => { const d = b - a; return d > 0 ? `<span class="text-green-400">+${d}</span>` : d < 0 ? `<span class="text-red-400">${d}</span>` : `<span class="text-slate-600">0</span>`; };
-
-    return `
-      <div class="bg-slate-800 border border-slate-700 rounded-xl p-5 card-in">
-        <h3 class="font-bold text-slate-200 text-sm mb-1">${esc(scenario.title)}</h3>
-        <p class="text-slate-500 text-xs italic mb-3">"${esc(scenario.text)}"</p>
-        ${question ? `<p class="text-amber-400 text-xs mb-3">What If: "${esc(question)}"</p>` : ''}
-        <table class="w-full text-xs">
-          <thead>
-            <tr class="text-slate-500">
-              <th class="text-left font-semibold pb-1"></th>
-              <th class="text-center font-semibold pb-1">Before</th>
-              <th class="text-center font-semibold pb-1">After</th>
-              <th class="text-center font-semibold pb-1">Shift</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr><td class="text-green-400 font-bold py-0.5">Supports</td><td class="text-center text-slate-400">${orig.supports}</td><td class="text-center text-slate-300 font-semibold">${final.supports}</td><td class="text-center">${diff(orig.supports, final.supports)}</td></tr>
-            <tr><td class="text-red-400 font-bold py-0.5">Erodes</td><td class="text-center text-slate-400">${orig.erodes}</td><td class="text-center text-slate-300 font-semibold">${final.erodes}</td><td class="text-center">${diff(orig.erodes, final.erodes)}</td></tr>
-            <tr><td class="text-yellow-400 font-bold py-0.5">Depends</td><td class="text-center text-slate-400">${orig.depends}</td><td class="text-center text-slate-300 font-semibold">${final.depends}</td><td class="text-center">${diff(orig.depends, final.depends)}</td></tr>
-          </tbody>
-        </table>
-      </div>`;
+    return `<div class="bg-slate-800 border border-slate-700 rounded-xl p-5 card-in">
+      <h3 class="font-bold text-slate-200 text-sm mb-1">${esc(scenario.title)}</h3>
+      <p class="text-slate-500 text-xs italic mb-3">"${esc(scenario.text)}"</p>
+      ${question ? `<p class="text-amber-400 text-xs mb-3">What If: "${esc(question)}"</p>` : ''}
+      <table class="w-full text-xs">
+        <thead><tr class="text-slate-500"><th class="text-left pb-1"></th><th class="text-center pb-1">Before</th><th class="text-center pb-1">After</th><th class="text-center pb-1">Shift</th></tr></thead>
+        <tbody>
+          <tr><td class="text-green-400 font-bold py-0.5">Supports</td><td class="text-center text-slate-400">${orig.s}</td><td class="text-center text-slate-300 font-semibold">${final.s}</td><td class="text-center">${diff(orig.s,final.s)}</td></tr>
+          <tr><td class="text-red-400 font-bold py-0.5">Erodes</td><td class="text-center text-slate-400">${orig.e}</td><td class="text-center text-slate-300 font-semibold">${final.e}</td><td class="text-center">${diff(orig.e,final.e)}</td></tr>
+          <tr><td class="text-yellow-400 font-bold py-0.5">Depends</td><td class="text-center text-slate-400">${orig.d}</td><td class="text-center text-slate-300 font-semibold">${final.d}</td><td class="text-center">${diff(orig.d,final.d)}</td></tr>
+        </tbody>
+      </table>
+    </div>`;
   });
 
   return `
     <span class="inline-block text-xs font-black uppercase tracking-widest bg-slate-700 text-slate-300 px-3 py-1 rounded-full mb-4">Summary</span>
     <h1 class="text-3xl font-black text-slate-100 mb-2">How Votes Shifted</h1>
     <p class="text-slate-500 text-sm mb-6">Before and after "What If?" challenges across all four scenarios.</p>
-    <div class="grid grid-cols-2 gap-4 mb-8">
-      ${scenarioSummaries.join('')}
-    </div>
-
-    <div class="border-t border-slate-700 pt-6 mt-2">
+    <div class="grid grid-cols-2 gap-4 mb-8">${scenarioSummaries.join('')}</div>
+    <div class="border-t border-slate-700 pt-6">
       <h2 class="text-xl font-black text-slate-100 mb-4">Reflect &amp; Discuss</h2>
       <div class="space-y-3 mb-6">
-        <div class="bg-slate-800 border-l-4 border-indigo-500 rounded-r-xl px-5 py-4 text-slate-200 text-base leading-relaxed">
-          How did the "What If?" challenges shift your thinking?
-        </div>
-        <div class="bg-slate-800 border-l-4 border-indigo-500 rounded-r-xl px-5 py-4 text-slate-200 text-base leading-relaxed">
-          Are there any "Erode" examples you'd still use? Why?
-        </div>
-        <div class="bg-slate-800 border-l-4 border-indigo-500 rounded-r-xl px-5 py-4 text-slate-200 text-base leading-relaxed">
-          What personal takeaways do you have? Is there anything you want to try, change, or avoid?
-        </div>
+        <div class="bg-slate-800 border-l-4 border-indigo-500 rounded-r-xl px-5 py-4 text-slate-200 text-base leading-relaxed">How did the "What If?" challenges shift your thinking?</div>
+        <div class="bg-slate-800 border-l-4 border-indigo-500 rounded-r-xl px-5 py-4 text-slate-200 text-base leading-relaxed">Are there any "Erode" examples you'd still use? Why?</div>
+        <div class="bg-slate-800 border-l-4 border-indigo-500 rounded-r-xl px-5 py-4 text-slate-200 text-base leading-relaxed">What personal takeaways do you have? Is there anything you want to try, change, or avoid?</div>
       </div>
-
       <div class="bg-indigo-950 border border-indigo-800 rounded-xl px-5 py-5">
         <h3 class="text-sm font-bold text-indigo-300 uppercase tracking-widest mb-2">Role Check</h3>
-        <p class="text-slate-200 text-base leading-relaxed">
-          How might these scenarios change if you are a middle schooler versus an adult?
-          What would acceptable use look like for each group?
-        </p>
+        <p class="text-slate-200 text-base leading-relaxed">How might these scenarios change if you are a middle schooler versus an adult? What would acceptable use look like for each group?</p>
       </div>
     </div>`;
 }
 
 function voteBarHTML(label, count, pct, gradient, textColor) {
-  return `
-    <div class="flex items-center gap-3">
-      <div class="w-20 text-xs font-black uppercase tracking-wide ${textColor}">${label}</div>
-      <div class="flex-1 h-10 bg-slate-800 rounded-lg overflow-hidden">
-        <div class="h-full bg-gradient-to-r ${gradient} rounded-lg bar-fill" style="width:${pct}%"></div>
-      </div>
-      <div class="w-10 text-right text-2xl font-black ${textColor} tabular-nums">${count}</div>
-    </div>`;
+  return `<div class="flex items-center gap-3">
+    <div class="w-20 text-xs font-black uppercase tracking-wide ${textColor}">${label}</div>
+    <div class="flex-1 h-10 bg-slate-800 rounded-lg overflow-hidden">
+      <div class="h-full bg-gradient-to-r ${gradient} rounded-lg bar-fill" style="width:${pct}%"></div>
+    </div>
+    <div class="w-10 text-right text-2xl font-black ${textColor} tabular-nums">${count}</div>
+  </div>`;
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  FACILITATOR VIEW  (?view=facilitator)
+//  FACILITATOR VIEW
 // ═══════════════════════════════════════════════════════════════
 function renderFacilitator() {
   if (!facilitatorAuthed) { renderFacilitatorLogin(); return; }
+  if (!roomCode)           { renderRoomCreate(); return; }
 
-  const phase = PHASES[phaseIndex];
-  if (responseUnsub) { responseUnsub(); responseUnsub = null; }
-  currentResponses = [];
+  const phase    = PHASES[phaseIndex];
+  const baseUrl  = location.origin + location.pathname;
+  const partUrl  = `${baseUrl}?room=${roomCode}`;
+  const dispUrl  = `${baseUrl}?view=display&room=${roomCode}`;
 
-  if (phase.type === 'summary') {
-    responseUnsub = db.collection('responses')
-      .where('type', 'in', ['vote', 'revote'])
-      .onSnapshot(snap => {
-        allResponses = snap.docs.map(d => d.data());
-        paintFacilitator();
-      });
-  } else if (['vote', 'revote'].includes(phase.type)) {
-    paintFacilitator();
-    responseUnsub = db.collection('responses')
-      .where('phaseId', '==', phase.id)
-      .onSnapshot(snap => {
-        currentResponses = snap.docs.map(d => d.data());
-        paintFacilitator();
-      });
-  } else if (phase.type === 'whatif') {
-    const votePhaseId = phase.id.replace('-whatif', '-vote');
-    paintFacilitator();
-    responseUnsub = db.collection('responses')
-      .where('phaseId', '==', votePhaseId)
-      .onSnapshot(snap => {
-        currentResponses = snap.docs.map(d => d.data());
-        paintFacilitator();
-      });
-  } else {
-    paintFacilitator();
-  }
-}
-
-function paintFacilitator() {
-  const phase = PHASES[phaseIndex];
-  const r = currentResponses;
+  // Get responses for the current phase (or original vote phase during whatif)
+  const votePhaseId = phase.type === 'whatif' ? phase.id.replace('-whatif', '-vote') : phase.id;
+  const r = responsesFor(votePhaseId);
+  const s = r.filter(x => x.vote === 'supports').length;
+  const e = r.filter(x => x.vote === 'erodes').length;
+  const d = r.filter(x => x.vote === 'depends').length;
 
   let summary = '';
 
-  if (phase.type === 'vote' || phase.type === 'revote') {
-    const s = r.filter(x => x.vote === 'supports').length;
-    const e = r.filter(x => x.vote === 'erodes').length;
-    const d = r.filter(x => x.vote === 'depends').length;
-    summary = `
-      <div class="flex gap-2 mb-4 flex-wrap">
-        <span class="bg-green-900 text-green-300 text-xs font-bold px-3 py-1 rounded-lg">Supports: ${s}</span>
-        <span class="bg-red-900 text-red-300 text-xs font-bold px-3 py-1 rounded-lg">Erodes: ${e}</span>
-        <span class="bg-yellow-900 text-yellow-300 text-xs font-bold px-3 py-1 rounded-lg">Depends: ${d}</span>
-      </div>`;
+  if (phase.type === 'vote' || phase.type === 'revote' || phase.type === 'whatif') {
+    summary = `<div class="flex gap-2 mb-4 flex-wrap">
+      <span class="bg-green-900 text-green-300 text-xs font-bold px-3 py-1 rounded-lg">Supports: ${s}</span>
+      <span class="bg-red-900 text-red-300 text-xs font-bold px-3 py-1 rounded-lg">Erodes: ${e}</span>
+      <span class="bg-yellow-900 text-yellow-300 text-xs font-bold px-3 py-1 rounded-lg">Depends: ${d}</span>
+      <span class="bg-slate-700 text-slate-300 text-xs font-bold px-3 py-1 rounded-lg">Total: ${r.length}</span>
+    </div>`;
+  }
 
-  } else if (phase.type === 'whatif') {
+  if (phase.type === 'whatif') {
     const selectedQ = getWhatif(phase.id);
-    // Show vote results from original vote
-    const s = r.filter(x => x.vote === 'supports').length;
-    const e = r.filter(x => x.vote === 'erodes').length;
-    const d = r.filter(x => x.vote === 'depends').length;
-    summary = `
-      <div class="flex gap-2 mb-4 flex-wrap">
-        <span class="bg-green-900 text-green-300 text-xs font-bold px-3 py-1 rounded-lg">Supports: ${s}</span>
-        <span class="bg-red-900 text-red-300 text-xs font-bold px-3 py-1 rounded-lg">Erodes: ${e}</span>
-        <span class="bg-yellow-900 text-yellow-300 text-xs font-bold px-3 py-1 rounded-lg">Depends: ${d}</span>
-      </div>
-      <p class="text-xs font-bold uppercase tracking-widest text-amber-400 mb-3">Choose a "What If?" — selecting will send it to participants and open revoting</p>
+    summary += `
+      <p class="text-xs font-bold uppercase tracking-widest text-amber-400 mb-3">Choose a "What If?" — selecting will send it to participants and advance to revoting</p>
       <div class="space-y-2">
         ${WHAT_IFS.map((q, i) => `
           <button onclick="selectWhatif('${phase.id}', ${i})"
             class="w-full text-left px-4 py-3 rounded-xl text-sm transition border
-              ${selectedQ === q ? 'bg-amber-900 border-amber-600 text-amber-200 font-semibold' : 'bg-slate-700 border-slate-600 text-slate-300 hover:bg-slate-600 hover:border-slate-500'}">
+              ${selectedQ === q ? 'bg-amber-900 border-amber-600 text-amber-200 font-semibold' : 'bg-slate-700 border-slate-600 text-slate-300 hover:bg-slate-600'}">
             ${esc(q)}
           </button>`).join('')}
         <div class="flex gap-2 mt-3">
@@ -615,19 +606,21 @@ function paintFacilitator() {
             class="px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white text-sm font-semibold rounded-xl transition">Use</button>
         </div>
       </div>`;
-
   } else if (phase.type === 'summary') {
-    summary = '<p class="text-slate-400 text-sm">Summary is displayed on the display view. Share your screen to show participants.</p>';
-
-  } else {
+    summary = '<p class="text-slate-400 text-sm">Summary is shown on the display view.</p>';
+  } else if (!summary) {
     summary = '<p class="text-slate-600 text-xs">No participant input for this phase.</p>';
   }
 
   setHTML(`
     <div class="min-h-screen bg-slate-900 text-slate-200 flex flex-col">
       <header class="bg-slate-800 border-b border-slate-700 px-5 py-3 flex justify-between items-center flex-shrink-0">
-        <span class="font-bold text-sm text-indigo-300">Facilitator Dashboard — The AI Effect</span>
-        <span class="text-slate-500 text-xs">${r.length} response${r.length !== 1 ? 's' : ''}</span>
+        <span class="font-bold text-sm text-indigo-300">Facilitator — The AI Effect</span>
+        <div class="flex items-center gap-4">
+          <span class="text-slate-500 text-xs">Room</span>
+          <span class="font-black text-lg text-white tracking-widest">${esc(roomCode)}</span>
+          <button onclick="newSession()" class="text-xs text-slate-500 hover:text-slate-300 border border-slate-700 hover:border-slate-500 px-2 py-1 rounded-lg transition">+ New Session</button>
+        </div>
       </header>
       <div class="flex flex-1 overflow-hidden">
         <div class="w-56 bg-slate-800 border-r border-slate-700 overflow-y-auto p-3 flex-shrink-0">
@@ -646,17 +639,30 @@ function paintFacilitator() {
             <button onclick="nextPhase()" ${phaseIndex === PHASES.length - 1 ? 'disabled' : ''}
               class="px-5 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-30 disabled:cursor-not-allowed text-white text-sm font-semibold rounded-lg transition">Next →</button>
             <button onclick="resetCurrentPhase()"
-              class="ml-auto px-4 py-2 border border-slate-600 text-slate-500 text-xs rounded-lg hover:border-red-500 hover:text-red-400 transition">Clear phase responses</button>
+              class="ml-auto px-4 py-2 border border-slate-600 text-slate-500 text-xs rounded-lg hover:border-red-500 hover:text-red-400 transition">Clear phase</button>
             <button onclick="resetSession()"
-              class="px-4 py-2 border border-slate-600 text-slate-500 text-xs rounded-lg hover:border-red-500 hover:text-red-400 transition">Reset entire session</button>
+              class="px-4 py-2 border border-slate-600 text-slate-500 text-xs rounded-lg hover:border-red-500 hover:text-red-400 transition">Reset session</button>
           </div>
           <p class="text-xs font-bold uppercase tracking-widest text-indigo-400 mb-1">Current Phase</p>
           <h2 class="text-xl font-bold text-slate-100 mb-2">${esc(phase.label)}</h2>
-          ${phase.scenarioIndex !== undefined ? `<div class="bg-slate-800 border-l-4 border-indigo-500 rounded-r-xl px-4 py-3 mb-4"><p class="text-slate-300 text-sm italic leading-relaxed">"${esc(SCENARIOS[phase.scenarioIndex].text)}"</p></div>` : ''}
+          ${phase.scenarioIndex !== undefined ? `<div class="bg-slate-800 border-l-4 border-indigo-500 rounded-r-xl px-4 py-3 mb-4"><p class="text-slate-300 text-sm italic">"${esc(SCENARIOS[phase.scenarioIndex].text)}"</p></div>` : ''}
           ${summary}
-          <div class="flex gap-3 mt-8 pt-5 border-t border-slate-800">
-            <a href="?view=display" target="_blank" class="text-xs text-indigo-400 bg-indigo-900 px-3 py-1.5 rounded-lg hover:bg-indigo-800 transition">Open display view ↗</a>
-            <a href="?" target="_blank" class="text-xs text-slate-400 bg-slate-800 px-3 py-1.5 rounded-lg hover:bg-slate-700 transition">Open participant view ↗</a>
+          <div class="mt-8 pt-5 border-t border-slate-800">
+            <p class="text-xs font-bold uppercase tracking-widest text-slate-600 mb-3">Share with participants</p>
+            <div class="space-y-2">
+              <div class="flex items-center gap-3 bg-slate-800 rounded-xl px-4 py-3">
+                <span class="text-slate-500 text-xs w-20 shrink-0">Participant</span>
+                <span class="text-slate-300 text-xs font-mono flex-1 truncate">${esc(partUrl)}</span>
+                <button onclick="copyToClipboard('${esc(partUrl)}')" class="text-indigo-400 text-xs hover:text-indigo-300 shrink-0">Copy</button>
+                <a href="${esc(partUrl)}" target="_blank" class="text-indigo-400 text-xs hover:text-indigo-300 shrink-0">↗</a>
+              </div>
+              <div class="flex items-center gap-3 bg-slate-800 rounded-xl px-4 py-3">
+                <span class="text-slate-500 text-xs w-20 shrink-0">Display</span>
+                <span class="text-slate-300 text-xs font-mono flex-1 truncate">${esc(dispUrl)}</span>
+                <button onclick="copyToClipboard('${esc(dispUrl)}')" class="text-indigo-400 text-xs hover:text-indigo-300 shrink-0">Copy</button>
+                <a href="${esc(dispUrl)}" target="_blank" class="text-indigo-400 text-xs hover:text-indigo-300 shrink-0">↗</a>
+              </div>
+            </div>
           </div>
         </div>
       </div>
@@ -668,11 +674,10 @@ function renderFacilitatorLogin() {
     <div class="min-h-screen bg-slate-900 flex items-center justify-center">
       <div class="bg-slate-800 border border-slate-700 rounded-2xl p-10 w-80 shadow-2xl">
         <h1 class="text-lg font-bold text-slate-100 mb-1">Facilitator Access</h1>
-        <p class="text-slate-500 text-xs mb-5">The AI Effect — Session Dashboard</p>
+        <p class="text-slate-500 text-xs mb-5">The AI Effect</p>
         <input type="password" id="pw-input" placeholder="Enter password"
           class="w-full bg-slate-900 border border-slate-600 rounded-xl px-4 py-3 text-slate-100 text-sm mb-3 focus:outline-none focus:border-indigo-500" />
-        <button id="pw-submit"
-          class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-semibold py-3 rounded-xl transition text-sm">Sign in</button>
+        <button id="pw-submit" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-semibold py-3 rounded-xl transition text-sm">Sign in</button>
         <p id="pw-error" class="text-red-400 text-xs mt-2 hidden">Incorrect password.</p>
       </div>
     </div>`);
@@ -681,55 +686,59 @@ function renderFacilitatorLogin() {
     if (document.getElementById('pw-input')?.value === FACILITATOR_PASSWORD) {
       facilitatorAuthed = true;
       sessionStorage.setItem('fac-authed', 'true');
-      renderFacilitator();
+      if (roomCode) startListening(); else renderRoomCreate();
     } else {
       document.getElementById('pw-error')?.classList.remove('hidden');
     }
   };
-  document.getElementById('pw-submit')?.addEventListener('click', doLogin);
-  document.getElementById('pw-input')?.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
-  document.getElementById('pw-input')?.focus();
+  document.getElementById('pw-submit').addEventListener('click', doLogin);
+  document.getElementById('pw-input').addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+  document.getElementById('pw-input').focus();
 }
 
 // ── Facilitator actions ───────────────────────────────────────
+window.newSession = () => {
+  const url = new URL(location.href);
+  url.searchParams.delete('room');
+  location.href = url.toString();
+};
 window.nextPhase = () => {
-  if (phaseIndex < PHASES.length - 1) db.collection('sessions').doc('current').set({ ...sessionData, phaseIndex: phaseIndex + 1 }, { merge: true });
+  if (phaseIndex < PHASES.length - 1) sessionRef().update({ phaseIndex: phaseIndex + 1 });
 };
 window.prevPhase = () => {
-  if (phaseIndex > 0) db.collection('sessions').doc('current').set({ ...sessionData, phaseIndex: phaseIndex - 1 }, { merge: true });
+  if (phaseIndex > 0) sessionRef().update({ phaseIndex: phaseIndex - 1 });
 };
-window.gotoPhase = (i) => {
-  db.collection('sessions').doc('current').set({ ...sessionData, phaseIndex: i }, { merge: true });
+window.gotoPhase = i => {
+  sessionRef().update({ phaseIndex: i });
 };
-// Select What If: writes to Firestore and auto-advances to revote
 window.selectWhatif = (phaseId, idx) => {
-  const whatifs = sessionData.whatifs || {};
-  whatifs[phaseId] = WHAT_IFS[idx];
-  // Auto-advance to next phase (revote)
-  db.collection('sessions').doc('current').set({ ...sessionData, whatifs, phaseIndex: phaseIndex + 1 }, { merge: true });
+  const whatifs = { ...(sessionData.whatifs || {}), [phaseId]: WHAT_IFS[idx] };
+  sessionRef().update({ whatifs, phaseIndex: phaseIndex + 1 });
 };
-window.selectCustomWhatif = (phaseId) => {
+window.selectCustomWhatif = phaseId => {
   const text = document.getElementById('custom-whatif')?.value?.trim();
   if (!text) return;
-  const whatifs = sessionData.whatifs || {};
-  whatifs[phaseId] = text;
-  db.collection('sessions').doc('current').set({ ...sessionData, whatifs, phaseIndex: phaseIndex + 1 }, { merge: true });
+  const whatifs = { ...(sessionData.whatifs || {}), [phaseId]: text };
+  sessionRef().update({ whatifs, phaseIndex: phaseIndex + 1 });
 };
 window.resetCurrentPhase = async () => {
   if (!confirm('Clear all responses for this phase?')) return;
-  const snap = await db.collection('responses').where('phaseId', '==', PHASES[phaseIndex].id).get();
-  const batch = db.batch();
-  snap.docs.forEach(doc => batch.delete(doc.ref));
-  await batch.commit();
+  const phaseId   = PHASES[phaseIndex].id;
+  const responses = sessionData.responses || {};
+  const updateData = {};
+  Object.keys(responses).forEach(key => {
+    if (responses[key].phaseId === phaseId) {
+      updateData[`responses.${key}`] = firebase.firestore.FieldValue.delete();
+    }
+  });
+  if (Object.keys(updateData).length > 0) await sessionRef().update(updateData);
 };
 window.resetSession = async () => {
-  if (!confirm('Reset the entire session? This clears all votes, What If? selections, and returns to the Welcome screen.')) return;
-  const snap = await db.collection('responses').get();
-  const batch = db.batch();
-  snap.docs.forEach(doc => batch.delete(doc.ref));
-  await batch.commit();
-  window._pendingWhatif = {};
-  await db.collection('sessions').doc('current').set({ phaseIndex: 0, whatifs: {} });
+  if (!confirm('Reset the entire session? This clears all votes and returns to the Welcome screen.')) return;
+  await sessionRef().set({ phaseIndex: 0, whatifs: {}, responses: {} });
+};
+window.copyToClipboard = text => {
+  navigator.clipboard.writeText(text).catch(() => {}).then(() => alert('Copied!'));
 };
 
 // ── Helpers ───────────────────────────────────────────────────
@@ -738,7 +747,6 @@ function esc(str) {
   return String(str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-// ── Go ────────────────────────────────────────────────────────
 boot();
 </script>
 </body>
